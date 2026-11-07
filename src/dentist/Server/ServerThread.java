@@ -1,20 +1,40 @@
 package dentist.Server;
 
+import dentist.Message;
+import dentist.MessageBookAppointment;
+import dentist.MessageBookAppointmentResult;
+import dentist.MessageConnect;
+import dentist.MessageConnectResult;
+import dentist.MessageDisconnect;
+import dentist.MessageGetSchedule;
+import dentist.MessageGetScheduleResult;
+import dentist.Protocol;
+import dentist.TimeSlot;
+
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.Socket;
+import java.net.SocketException;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import dentist.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ServerThread extends Thread {
 
-    private Socket socket;
-    private ObjectInputStream is;
-    private ObjectOutputStream os;
-    private String clientName;
-    private boolean connected = false;
+    private static final int HANDSHAKE_TIMEOUT_MS = 10_000;
+
+    private static final DateTimeFormatter FORMATTER =
+            DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+
+    private final Socket socket;
+    private final AtomicBoolean disconnected = new AtomicBoolean();
+
+    private ObjectInputStream input;
+    private ObjectOutputStream output;
+    private volatile String clientName;
 
     public ServerThread(Socket socket) {
         this.socket = socket;
@@ -23,171 +43,241 @@ public class ServerThread extends Thread {
     @Override
     public void run() {
         try {
-            os = new ObjectOutputStream(socket.getOutputStream());
-            is = new ObjectInputStream(socket.getInputStream());
+            socket.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
 
-            if (processConnect()) {
-                connected = true;
+            output = new ObjectOutputStream(socket.getOutputStream());
+            output.flush();
 
-                while (connected) {
-                    try {
-                        Message msg = (Message) is.readObject();
+            input = new ObjectInputStream(socket.getInputStream());
 
-                        if (msg == null) {
-                            break;
-                        }
-
-                        processMessage(msg);
-
-                    } catch (ClassNotFoundException e) {
-                        System.err.println("Неизвестный тип сообщения: " + e.getMessage());
-                        break;
-                    } catch (IOException e) {
-                        break;
-                    }
-                }
+            if (!processConnect()) {
+                return;
             }
 
-        } catch (IOException e) {
-            System.err.println("Ошибка I/O в ServerThread: " + e.getMessage());
+            socket.setSoTimeout(0);
+
+            while (!isDisconnected() && !ServerMain.getStopFlag()) {
+                Message message = readMessage();
+
+                if (!processMessage(message)) {
+                    break;
+                }
+            }
+        } catch (EOFException e) {
+            System.out.println(
+                    "[DISCONNECT] Соединение закрыто клиентом: " + clientLabel()
+            );
+        } catch (SocketException e) {
+            if (!isDisconnected() && !ServerMain.getStopFlag()) {
+                System.err.println(
+                        "Ошибка соединения с " + clientLabel()
+                                + ": " + e.getMessage()
+                );
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            if (!isDisconnected() && !ServerMain.getStopFlag()) {
+                System.err.println(
+                        "Ошибка сеанса " + clientLabel()
+                                + ": " + e.getMessage()
+                );
+            }
         } finally {
             disconnect();
         }
     }
 
-    private boolean processConnect() {
-        try {
-            Message msg = (Message) is.readObject();
+    private boolean processConnect()
+            throws IOException, ClassNotFoundException {
 
-            if (msg.getID() != Protocol.CMD_CONNECT) {
-                os.writeObject(new MessageConnectResult(
-                        Protocol.RESULT_CODE_ERROR,
-                        "Ожидалось сообщение подключения"));
-                return false;
-            }
+        Message message = readMessage();
 
-            MessageConnect connectMsg = (MessageConnect) msg;
-            clientName = connectMsg.getClientName();
-
-            if (!ServerMain.addClient(clientName, this)) {
-                os.writeObject(new MessageConnectResult(
-                        Protocol.RESULT_CODE_ERROR,
-                        "Клиент с таким именем уже подключен"));
-                return false;
-            }
-
-            os.writeObject(new MessageConnectResult(Protocol.RESULT_CODE_OK));
-
-            System.out.println("[CONNECT] Клиент '" + clientName + "' подключился");
-            return true;
-
-        } catch (Exception e) {
-            System.err.println("Ошибка при подключении: " + e.getMessage());
+        if (!(message instanceof MessageConnect)
+                || message.getID() != Protocol.CMD_CONNECT) {
+            send(new MessageConnectResult(
+                    Protocol.RESULT_CODE_ERROR,
+                    "Ожидалось сообщение подключения"
+            ));
             return false;
         }
-    }
 
-    private void processMessage(Message msg) {
-        try {
-            switch (msg.getID()) {
-                case Protocol.CMD_DISCONNECT:
-                    processDisconnect();
-                    break;
+        MessageConnect connectMessage = (MessageConnect) message;
+        String requestedName = connectMessage.getClientName();
 
-                case Protocol.CMD_GET_SCHEDULE:
-                    processGetSchedule();
-                    break;
-
-                case Protocol.CMD_BOOK_APPOINTMENT:
-                    processBookAppointment((MessageBookAppointment) msg);
-                    break;
-
-                default:
-                    System.err.println("Неизвестная команда: " + msg.getID());
-            }
-        } catch (Exception e) {
-            System.err.println("Ошибка обработки сообщения: " + e.getMessage());
-            e.printStackTrace();
+        if (isBlank(requestedName)) {
+            send(new MessageConnectResult(
+                    Protocol.RESULT_CODE_ERROR,
+                    "Имя клиента не должно быть пустым"
+            ));
+            return false;
         }
+
+        clientName = requestedName.trim();
+
+        if (!ServerMain.addClient(clientName, this)) {
+            send(new MessageConnectResult(
+                    Protocol.RESULT_CODE_ERROR,
+                    "Имя уже занято или сервер останавливается"
+            ));
+            return false;
+        }
+
+        send(new MessageConnectResult(Protocol.RESULT_CODE_OK));
+
+        System.out.println(
+                "[CONNECT] Клиент '" + clientName + "' подключился"
+        );
+
+        return true;
     }
 
-    private void processDisconnect() {
-        System.out.println("[DISCONNECT] Клиент '" + clientName + "' отключился");
-        connected = false;
+    private Message readMessage()
+            throws IOException, ClassNotFoundException {
+
+        Object object = input.readObject();
+
+        if (!(object instanceof Message)) {
+            throw new IOException("Получен объект неизвестного типа");
+        }
+
+        return (Message) object;
+    }
+
+    private boolean processMessage(Message message) throws IOException {
+        switch (message.getID()) {
+            case Protocol.CMD_DISCONNECT:
+                if (!(message instanceof MessageDisconnect)) {
+                    throw new IOException("Неверный тип команды отключения");
+                }
+
+                return false;
+
+            case Protocol.CMD_GET_SCHEDULE:
+                if (!(message instanceof MessageGetSchedule)) {
+                    throw new IOException("Неверный тип запроса расписания");
+                }
+
+                processGetSchedule();
+                return true;
+
+            case Protocol.CMD_BOOK_APPOINTMENT:
+                if (!(message instanceof MessageBookAppointment)) {
+                    throw new IOException("Неверный тип запроса бронирования");
+                }
+
+                processBookAppointment((MessageBookAppointment) message);
+                return true;
+
+            default:
+                throw new IOException(
+                        "Неизвестная команда: " + message.getID()
+                );
+        }
     }
 
     private void processGetSchedule() throws IOException {
-        System.out.println("[REQUEST] " + clientName + " запросил расписание");
-
         ArrayList<TimeSlot> available = ServerMain.getAvailableSlots();
 
-        MessageGetScheduleResult result = new MessageGetScheduleResult(
+        send(new MessageGetScheduleResult(
                 Protocol.RESULT_CODE_OK,
                 available
+        ));
+
+        System.out.println(
+                "[SCHEDULE] Клиенту '" + clientName
+                        + "' отправлено слотов: " + available.size()
         );
-
-        os.writeObject(result);
-
-        System.out.println("[RESPONSE] Отправлено " + available.size() + " свободных слотов");
     }
 
-    private void processBookAppointment(MessageBookAppointment msg) throws IOException {
-        System.out.println("[BOOKING REQUEST] " + clientName + " пытается забронировать " +
-                msg.getDateTime().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")));
+    private void processBookAppointment(MessageBookAppointment message)
+            throws IOException {
 
-        boolean success = ServerMain.bookSlot(
-                msg.getDateTime(),
-                msg.getPatientName(),
-                msg.getPatientPhone(),
-                msg.getComplaints()
+        LocalDateTime dateTime = message.getDateTime();
+
+        if (dateTime == null
+                || isBlank(message.getPatientName())
+                || isBlank(message.getPatientPhone())
+                || isBlank(message.getComplaints())) {
+
+            send(new MessageBookAppointmentResult(
+                    Protocol.RESULT_CODE_ERROR,
+                    "Дата, ФИО, телефон и причина обращения обязательны"
+            ));
+            return;
+        }
+
+        if (!dateTime.isAfter(LocalDateTime.now())) {
+            send(new MessageBookAppointmentResult(
+                    Protocol.RESULT_CODE_ERROR,
+                    "Нельзя записаться на прошедшее время"
+            ));
+            return;
+        }
+
+        String patientName = message.getPatientName().trim();
+        String patientPhone = message.getPatientPhone().trim();
+        String complaints = message.getComplaints().trim();
+
+        boolean booked = ServerMain.bookSlot(
+                dateTime,
+                patientName,
+                patientPhone,
+                complaints
         );
 
-        if (success) {
-            String confirmation = String.format(
-                    "Вы записаны на %s.\nФИО: %s\nТелефон: %s",
-                    msg.getDateTime().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")),
-                    msg.getPatientName(),
-                    msg.getPatientPhone()
-            );
-
-            os.writeObject(new MessageBookAppointmentResult(
-                    Protocol.RESULT_CODE_OK,
-                    confirmation
-            ));
-
-            System.out.println("[BOOKING SUCCESS] Запись оформлена для " + msg.getPatientName());
-
-        } else {
-            os.writeObject(new MessageBookAppointmentResult(
+        if (!booked) {
+            send(new MessageBookAppointmentResult(
                     Protocol.RESULT_CODE_SLOT_TAKEN,
-                    "Это время уже занято другим пациентом"
+                    "Выбранное время больше недоступно для записи"
             ));
-
-            System.out.println("[BOOKING FAILED] Слот уже занят");
+            return;
         }
+
+        String confirmation = String.format(
+                "Вы записаны на %s.%nФИО: %s%nТелефон: %s",
+                dateTime.format(FORMATTER),
+                patientName,
+                patientPhone
+        );
+
+        send(new MessageBookAppointmentResult(
+                Protocol.RESULT_CODE_OK,
+                confirmation
+        ));
+    }
+
+    private void send(Message message) throws IOException {
+        output.reset();
+        output.writeObject(message);
+        output.flush();
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    private String clientLabel() {
+        return clientName == null
+                ? socket.getRemoteSocketAddress().toString()
+                : clientName;
+    }
+
+    public boolean isDisconnected() {
+        return disconnected.get();
     }
 
     public void disconnect() {
-        connected = false;
-
-        if (clientName != null) {
-            ServerMain.removeClient(clientName);
-            System.out.println("[REMOVE] Клиент '" + clientName + "' удален из списка");
+        if (!disconnected.compareAndSet(false, true)) {
+            return;
         }
 
-        try {
-            if (os != null) os.close();
-        } catch (IOException e) {
-        }
+        ServerMain.removeClient(clientName, this);
 
         try {
-            if (is != null) is.close();
+            socket.close();
         } catch (IOException e) {
-        }
-
-        try {
-            if (socket != null) socket.close();
-        } catch (IOException e) {
+            System.err.println(
+                    "Ошибка закрытия соединения: " + e.getMessage()
+            );
         }
     }
 }

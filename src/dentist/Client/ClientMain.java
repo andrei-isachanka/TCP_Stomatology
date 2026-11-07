@@ -1,240 +1,305 @@
 package dentist.Client;
 
+import dentist.Message;
+import dentist.MessageBookAppointment;
+import dentist.MessageBookAppointmentResult;
+import dentist.MessageConnect;
+import dentist.MessageConnectResult;
+import dentist.MessageDisconnect;
+import dentist.MessageGetSchedule;
+import dentist.MessageGetScheduleResult;
+import dentist.Protocol;
+import dentist.TimeSlot;
+
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.Scanner;
-import dentist.*;
 
 public class ClientMain {
+
+    private static final int CONNECT_TIMEOUT_MS = 5_000;
+    private static final int READ_TIMEOUT_MS = 15_000;
+
+    private static final DateTimeFormatter FORMATTER =
+            DateTimeFormatter.ofPattern("dd.MM.yyyy (EEE) HH:mm",
+                    Locale.forLanguageTag("ru"));
 
     public static void main(String[] args) {
         if (args.length < 1 || args.length > 2) {
             System.err.println(
-                    "Неверное количество аргументов\n" +
-                            "Использование: java ClientMain <ваше_имя> [host]"
+                    "Использование: java dentist.Client.ClientMain <ваше_имя> [host]"
             );
-            waitKeyToStop();
             return;
         }
 
-        try (Socket sock = (args.length == 1 ?
-                new Socket(InetAddress.getLocalHost(), Protocol.PORT) :
-                new Socket(args[1], Protocol.PORT))) {
+        String clientName = args[0].trim();
 
-            System.out.println("Система записи к стоматологу");
-            System.out.println("Подключение к серверу...");
-            session(sock, args[0]);
+        if (clientName.isEmpty()) {
+            System.err.println("Имя клиента не должно быть пустым.");
+            return;
+        }
 
-        } catch (Exception e) {
-            System.err.println("Ошибка подключения: " + e.getMessage());
+        String host = args.length == 2 ? args[1] : "localhost";
+
+        System.out.println("Система записи к стоматологу");
+        System.out.println("Подключение к серверу...");
+
+        try (Socket socket = new Socket()) {
+            socket.connect(
+                    new InetSocketAddress(host, Protocol.PORT),
+                    CONNECT_TIMEOUT_MS
+            );
+            socket.setSoTimeout(READ_TIMEOUT_MS);
+            session(socket, clientName);
+        } catch (IOException | ClassNotFoundException e) {
+            System.err.println("Ошибка соединения: " + e.getMessage());
         } finally {
             System.out.println("\nДо свидания!");
         }
     }
 
-    static void waitKeyToStop() {
-        System.out.println("Нажмите Enter для выхода...");
-        try {
-            System.in.read();
-        } catch (IOException e) {
-        }
-    }
+    private static void session(Socket socket, String clientName)
+            throws IOException, ClassNotFoundException {
 
-    static class Session {
-        boolean connected = false;
-        String clientName = null;
+        try (ObjectOutputStream output =
+                     new ObjectOutputStream(socket.getOutputStream())) {
 
-        Session(String name) {
-            clientName = name;
-        }
-    }
+            output.flush();
 
-    static void session(Socket s, String name) {
-        try (Scanner in = new Scanner(System.in);
-             ObjectInputStream is = new ObjectInputStream(s.getInputStream());
-             ObjectOutputStream os = new ObjectOutputStream(s.getOutputStream())) {
+            try (ObjectInputStream input =
+                         new ObjectInputStream(socket.getInputStream())) {
 
-            Session ses = new Session(name);
+                send(output, new MessageConnect(clientName));
 
-            if (openSession(ses, is, os)) {
-                try {
-                    showMenu();
+                MessageConnectResult connectionResult =
+                        readResponse(input, MessageConnectResult.class);
 
-                    while (true) {
-                        System.out.print("\nВыберите действие (1-3): ");
-                        String choice = in.nextLine().trim();
+                if (connectionResult.Error()) {
+                    System.err.println(
+                            "Не удалось подключиться: "
+                                    + connectionResult.getErrorMessage()
+                    );
+                    return;
+                }
 
-                        if (choice.equals("1")) {
-                            viewSchedule(is, os);
-                        } else if (choice.equals("2")) {
-                            bookAppointment(is, os, in);
-                        } else if (choice.equals("3")) {
-                            System.out.println("Выход из системы...");
-                            break;
-                        } else {
-                            System.out.println("Неверный выбор. Попробуйте снова.");
-                        }
+                System.out.println("Подключение успешно!");
+                System.out.println("Добро пожаловать, " + clientName + "!");
+
+                Scanner console = new Scanner(System.in);
+                showMenu();
+
+                while (true) {
+                    System.out.print("\nВыберите действие (1-3): ");
+
+                    if (!console.hasNextLine()) {
+                        send(output, new MessageDisconnect());
+                        return;
                     }
-                } finally {
-                    closeSession(ses, os);
+
+                    String choice = console.nextLine().trim();
+
+                    switch (choice) {
+                        case "1":
+                            viewSchedule(input, output);
+                            break;
+                        case "2":
+                            bookAppointment(input, output, console);
+                            break;
+                        case "3":
+                            send(output, new MessageDisconnect());
+                            System.out.println("Выход из системы...");
+                            return;
+                        default:
+                            System.out.println(
+                                    "Неверный выбор. Попробуйте снова."
+                            );
+                    }
                 }
             }
-
-        } catch (Exception e) {
-            System.err.println("Ошибка сеанса: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 
-    static void showMenu() {
-        System.out.println("\n МЕНЮ");
+    private static void showMenu() {
+        System.out.println("\nМЕНЮ");
         System.out.println("1. Просмотреть свободное время");
         System.out.println("2. Записаться на прием");
         System.out.println("3. Выход");
         System.out.println("--------------------------------");
     }
 
-    static boolean openSession(Session ses, ObjectInputStream is, ObjectOutputStream os)
-            throws IOException, ClassNotFoundException {
+    private static void viewSchedule(
+            ObjectInputStream input,
+            ObjectOutputStream output
+    ) throws IOException, ClassNotFoundException {
 
-        os.writeObject(new MessageConnect(ses.clientName));
-        MessageConnectResult msg = (MessageConnectResult) is.readObject();
+        MessageGetScheduleResult result = requestSchedule(input, output);
 
-        if (!msg.Error()) {
-            System.out.println("Подключение успешно!");
-            System.out.println("Добро пожаловать, " + ses.clientName + "!");
-            ses.connected = true;
-            return true;
-        }
-
-        System.err.println("Не удалось подключиться: " + msg.getErrorMessage());
-        waitKeyToStop();
-        return false;
-    }
-
-    static void closeSession(Session ses, ObjectOutputStream os) {
-        if (ses.connected) {
-            try {
-                os.writeObject(new MessageDisconnect());
-                System.out.println("Отключено от сервера.");
-            } catch (IOException e) {
-                System.err.println("Ошибка при отключении: " + e.getMessage());
-            }
-        }
-    }
-
-    static void viewSchedule(ObjectInputStream is, ObjectOutputStream os)
-            throws IOException, ClassNotFoundException {
-
-        System.out.println("\n--- Запрос свободного расписания ---");
-        os.writeObject(new MessageGetSchedule());
-
-        MessageGetScheduleResult msg = (MessageGetScheduleResult) is.readObject();
-
-        if (msg.Error()) {
-            System.err.println("Ошибка получения расписания: " + msg.getErrorMessage());
+        if (result.Error()) {
+            System.err.println(
+                    "Ошибка получения расписания: " + result.getErrorMessage()
+            );
             return;
         }
 
-        ArrayList<TimeSlot> slots = msg.getAvailableSlots();
+        List<TimeSlot> slots = result.getAvailableSlots();
 
         if (slots.isEmpty()) {
-            System.out.println("К сожалению, нет свободных слотов на ближайшую неделю.");
-        } else {
-            System.out.println("\nСвободное время на неделю:");
-            System.out.println("----------------------------");
-
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy (EEE) HH:mm");
-            for (int i = 0; i < slots.size(); i++) {
-                TimeSlot slot = slots.get(i);
-                System.out.printf("%2d. %s\n", i + 1,
-                        slot.getDateTime().format(formatter));
-            }
-            System.out.println("----------------------------");
+            System.out.println("Нет свободных слотов на ближайшую неделю.");
+            return;
         }
 
+        System.out.println("\nСвободное время на неделю:");
+        printSlots(slots);
     }
 
-    static void bookAppointment(ObjectInputStream is,
-                                   ObjectOutputStream os, Scanner in)
-            throws IOException, ClassNotFoundException {
+    private static void bookAppointment(
+            ObjectInputStream input,
+            ObjectOutputStream output,
+            Scanner console
+    ) throws IOException, ClassNotFoundException {
 
-        System.out.println("\n--- Запись на прием ---");
+        MessageGetScheduleResult scheduleResult =
+                requestSchedule(input, output);
 
-        os.writeObject(new MessageGetSchedule());
-        MessageGetScheduleResult scheduleMsg = (MessageGetScheduleResult) is.readObject();
+        if (scheduleResult.Error()) {
+            System.err.println(
+                    "Ошибка получения расписания: "
+                            + scheduleResult.getErrorMessage()
+            );
+            return;
+        }
 
-        if (scheduleMsg.Error() || scheduleMsg.getAvailableSlots().isEmpty()) {
+        List<TimeSlot> slots = scheduleResult.getAvailableSlots();
+
+        if (slots.isEmpty()) {
             System.out.println("Нет свободных слотов для записи.");
             return;
         }
 
-        ArrayList<TimeSlot> slots = scheduleMsg.getAvailableSlots();
-
         System.out.println("\nДоступное время:");
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy (EEE) HH:mm");
-        for (int i = 0; i < slots.size(); i++) {
-            TimeSlot slot = slots.get(i);
-            System.out.printf("%2d. %s\n", i + 1,
-                    slot.getDateTime().format(formatter));
-        }
+        printSlots(slots);
 
         System.out.print("\nВыберите номер слота (или 0 для отмены): ");
-        String slotChoice = in.nextLine().trim();
+        String choice = readLine(console);
 
-        int slotIndex;
+        int slotNumber;
+
         try {
-            slotIndex = Integer.parseInt(slotChoice);
+            slotNumber = Integer.parseInt(choice);
         } catch (NumberFormatException e) {
-            System.out.println("Неверный ввод.");
+            System.out.println("Введите целое число.");
             return;
         }
 
-        if (slotIndex == 0) {
+        if (slotNumber == 0) {
             System.out.println("Отмена записи.");
             return;
         }
 
-        if (slotIndex < 1 || slotIndex > slots.size()) {
+        if (slotNumber < 1 || slotNumber > slots.size()) {
             System.out.println("Неверный номер слота.");
             return;
         }
 
-        TimeSlot selectedSlot = slots.get(slotIndex - 1);
-
         System.out.print("Введите ФИО: ");
-        String fullName = in.nextLine().trim();
+        String fullName = readLine(console);
 
         System.out.print("Введите телефон: ");
-        String phone = in.nextLine().trim();
+        String phone = readLine(console);
 
         System.out.print("Введите жалобы/причину обращения: ");
-        String complaints = in.nextLine().trim();
+        String complaints = readLine(console);
 
-        MessageBookAppointment bookMsg = new MessageBookAppointment(
+        if (fullName.isEmpty() || phone.isEmpty() || complaints.isEmpty()) {
+            System.out.println("ФИО, телефон и причина обращения обязательны.");
+            return;
+        }
+
+        TimeSlot selectedSlot = slots.get(slotNumber - 1);
+
+        send(output, new MessageBookAppointment(
                 selectedSlot.getDateTime(),
                 fullName,
                 phone,
                 complaints
-        );
+        ));
 
-        os.writeObject(bookMsg);
-        MessageBookAppointmentResult result = (MessageBookAppointmentResult) is.readObject();
+        MessageBookAppointmentResult result =
+                readResponse(input, MessageBookAppointmentResult.class);
 
         if (result.Error()) {
-            System.err.println("Ошибка бронирования: " + result.getErrorMessage());
-            if (result.getCode() == Protocol.RESULT_CODE_SLOT_TAKEN) {
-                System.out.println("Это время уже было занято другим клиентом.");
-            }
-        } else {
-            System.out.println("\n✓ " + result.getConfirmationMessage());
-            System.out.println("Ваша запись успешно оформлена!");
+            System.err.println(
+                    "Ошибка бронирования: " + result.getErrorMessage()
+            );
+            return;
         }
+
+        System.out.println("\n" + result.getConfirmationMessage());
+    }
+
+    private static MessageGetScheduleResult requestSchedule(
+            ObjectInputStream input,
+            ObjectOutputStream output
+    ) throws IOException, ClassNotFoundException {
+
+        send(output, new MessageGetSchedule());
+
+        return readResponse(input, MessageGetScheduleResult.class);
+    }
+
+    private static void printSlots(List<TimeSlot> slots) {
+        System.out.println("----------------------------");
+
+        for (int i = 0; i < slots.size(); i++) {
+            System.out.printf(
+                    "%2d. %s%n",
+                    i + 1,
+                    slots.get(i).getDateTime().format(FORMATTER)
+            );
+        }
+
+        System.out.println("----------------------------");
+    }
+
+    private static String readLine(Scanner console) throws EOFException {
+        if (!console.hasNextLine()) {
+            throw new EOFException("Ввод завершён.");
+        }
+
+        return console.nextLine().trim();
+    }
+
+    private static void send(
+            ObjectOutputStream output,
+            Message message
+    ) throws IOException {
+
+        output.reset();
+        output.writeObject(message);
+        output.flush();
+    }
+
+    private static <T> T readResponse(
+            ObjectInputStream input,
+            Class<T> expectedType
+    ) throws IOException, ClassNotFoundException {
+
+        Object response = input.readObject();
+
+        if (!expectedType.isInstance(response)) {
+            throw new IOException(
+                    "Неожиданный ответ сервера. Ожидался "
+                            + expectedType.getSimpleName()
+            );
+        }
+
+        return expectedType.cast(response);
     }
 }

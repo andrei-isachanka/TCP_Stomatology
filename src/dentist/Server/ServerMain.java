@@ -1,104 +1,140 @@
 package dentist.Server;
 
+import dentist.Protocol;
+import dentist.TimeSlot;
+
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.time.DayOfWeek;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Scanner;
-import dentist.*;
+import java.util.Set;
+import java.util.TreeMap;
 
 public class ServerMain {
 
-    private static int MAX_CLIENTS = 100;
+    private static final int MAX_CLIENTS = 100;
+    private static final int ACCEPT_TIMEOUT_MS = 1_000;
 
-    private static ArrayList<TimeSlot> schedule = new ArrayList<>();
-    private static Object syncSchedule = new Object();
+    private static final Object SCHEDULE_LOCK = new Object();
+    private static final Object CLIENTS_LOCK = new Object();
+
+    private static final ArrayList<TimeSlot> SCHEDULE = new ArrayList<>();
+
+    private static final TreeMap<String, ServerThread> CLIENTS =
+            new TreeMap<>();
+
+    private static final Set<ServerThread> CONNECTIONS = new HashSet<>();
+
+    private static final DateTimeFormatter FORMATTER =
+            DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+
+    private static volatile boolean stopFlag;
 
     public static void main(String[] args) {
-
         initializeSchedule();
 
-        try (ServerSocket serv = new ServerSocket(Protocol.PORT)) {
+        try (ServerSocket serverSocket = new ServerSocket(Protocol.PORT)) {
+            serverSocket.setSoTimeout(ACCEPT_TIMEOUT_MS);
+
             System.out.println("--- Сервер системы записи к стоматологу ---");
             System.out.println("Сервер запущен на порту " + Protocol.PORT);
-            System.out.println("Расписание инициализировано: " + schedule.size() + " слотов");
             System.out.println("Для остановки введите 'stop'");
-            System.out.println("----------------------------------------\n");
+            System.out.println("----------------------------------------");
 
-            ServerStopThread tester = new ServerStopThread();
-            tester.start();
+            ServerStopThread stopThread = new ServerStopThread();
+            stopThread.setDaemon(true);
+            stopThread.start();
 
-            while (true) {
-                Socket sock = accept(serv);
+            while (!getStopFlag()) {
+                Socket socket;
 
-                if (sock != null) {
-                    if (ServerMain.getNumClients() < ServerMain.MAX_CLIENTS) {
-                        System.out.println("[+] Клиент подключен: " +
-                                sock.getInetAddress().getHostName());
-                        ServerThread server = new ServerThread(sock);
-                        server.start();
-                    } else {
-                        System.out.println("[-] Отклонено подключение (превышен лимит): " +
-                                sock.getInetAddress().getHostName());
-                        sock.close();
-                    }
-                }
-
-                if (ServerMain.getStopFlag()) {
-                    break;
-                }
-            }
-
-        } catch (IOException e) {
-            System.err.println("Ошибка сервера: " + e.getMessage());
-        } finally {
-            stopAllClients();
-            System.out.println("\nСервер остановлен.");
-        }
-
-    }
-
-    private static void initializeSchedule() {
-        synchronized (syncSchedule) {
-            schedule.clear();
-
-            LocalDateTime now = LocalDateTime.now();
-            LocalDateTime start = now.plusHours(1).withMinute(0).withSecond(0).withNano(0);
-
-            for (int day = 0; day < 7; day++) {
-                LocalDateTime current = start.plusDays(day);
-
-                DayOfWeek dayOfWeek = current.getDayOfWeek();
-                if (dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY) {
+                try {
+                    socket = serverSocket.accept();
+                } catch (SocketTimeoutException e) {
                     continue;
                 }
 
-                LocalDateTime dayStart = current.withHour(9).withMinute(0);
-                LocalDateTime dayEnd = current.withHour(18).withMinute(0);
+                ServerThread client = new ServerThread(socket);
 
-                LocalDateTime slot = dayStart;
+                if (!registerConnection(client)) {
+                    client.disconnect();
+                    System.out.println(
+                            "[-] Подключение отклонено: лимит соединений "
+                                    + "или остановка сервера."
+                    );
+                    continue;
+                }
+
+                System.out.println(
+                        "[+] Подключение: "
+                                + socket.getInetAddress().getHostAddress()
+                );
+
+                client.start();
+            }
+        } catch (IOException e) {
+            System.err.println("Ошибка сервера: " + e.getMessage());
+        } finally {
+            setStopFlag(true);
+            stopAllClients();
+            System.out.println("\nСервер остановлен.");
+        }
+    }
+
+    private static void initializeSchedule() {
+        synchronized (SCHEDULE_LOCK) {
+            SCHEDULE.clear();
+
+            LocalDateTime now = LocalDateTime.now();
+            LocalDate firstDay = now.toLocalDate();
+
+            for (int day = 0; day < 7; day++) {
+                LocalDate date = firstDay.plusDays(day);
+                DayOfWeek dayOfWeek = date.getDayOfWeek();
+
+                if (dayOfWeek == DayOfWeek.SATURDAY
+                        || dayOfWeek == DayOfWeek.SUNDAY) {
+                    continue;
+                }
+
+                LocalDateTime slot =
+                        LocalDateTime.of(date, LocalTime.of(9, 0));
+
+                LocalDateTime dayEnd =
+                        LocalDateTime.of(date, LocalTime.of(18, 0));
+
                 while (slot.isBefore(dayEnd)) {
-                    schedule.add(new TimeSlot(slot));
+                    if (slot.isAfter(now)) {
+                        SCHEDULE.add(new TimeSlot(slot));
+                    }
+
                     slot = slot.plusMinutes(30);
                 }
             }
 
-            System.out.println("Инициализировано " + schedule.size() +
-                    " временных слотов на неделю вперед.");
+            System.out.println(
+                    "Инициализировано " + SCHEDULE.size()
+                            + " временных слотов на неделю вперед."
+            );
         }
     }
 
     public static ArrayList<TimeSlot> getAvailableSlots() {
-        synchronized (syncSchedule) {
+        synchronized (SCHEDULE_LOCK) {
             ArrayList<TimeSlot> available = new ArrayList<>();
             LocalDateTime now = LocalDateTime.now();
 
-            for (TimeSlot slot : schedule) {
+            for (TimeSlot slot : SCHEDULE) {
                 if (slot.isAvailable() && slot.getDateTime().isAfter(now)) {
-                    available.add(slot);
+                    available.add(new TimeSlot(slot.getDateTime()));
                 }
             }
 
@@ -106,99 +142,117 @@ public class ServerMain {
         }
     }
 
-    public static boolean bookSlot(LocalDateTime dateTime, String patientName,
-                                   String patientPhone, String complaints) {
-        synchronized (syncSchedule) {
-            for (TimeSlot slot : schedule) {
+    public static boolean bookSlot(
+            LocalDateTime dateTime,
+            String patientName,
+            String patientPhone,
+            String complaints
+    ) {
+        if (dateTime == null
+                || isBlank(patientName)
+                || isBlank(patientPhone)
+                || isBlank(complaints)) {
+            return false;
+        }
+
+        synchronized (SCHEDULE_LOCK) {
+            if (!dateTime.isAfter(LocalDateTime.now())) {
+                return false;
+            }
+
+            for (TimeSlot slot : SCHEDULE) {
                 if (slot.getDateTime().equals(dateTime)) {
-                    if (slot.isAvailable()) {
-                        slot.book(patientName, patientPhone, complaints);
-                        System.out.println("BOOKING " + patientName + " записан на " +
-                                dateTime.format(java.time.format.DateTimeFormatter.ofPattern(
-                                        "dd.MM.yyyy HH:mm")));
-                        return true;
-                    } else {
+                    if (!slot.isAvailable()) {
                         return false;
                     }
+
+                    slot.book(
+                            patientName.trim(),
+                            patientPhone.trim(),
+                            complaints.trim()
+                    );
+
+                    System.out.println(
+                            "[BOOKING] " + patientName.trim()
+                                    + " записан на "
+                                    + dateTime.format(FORMATTER)
+                    );
+
+                    return true;
                 }
             }
+
             return false;
         }
     }
 
-    public static Socket accept(ServerSocket serv) {
-        assert(serv != null);
-        try {
-            serv.setSoTimeout(1000);
-            Socket sock = serv.accept();
-            return sock;
-        } catch (SocketException e) {
-        } catch (IOException e) {
-        }
-        return null;
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
     }
 
-    private static void stopAllClients() {
-        String[] clients = getClients();
-        for (String client : clients) {
-            ServerThread ct = getClient(client);
-            if (ct != null) {
-                ct.disconnect();
+    private static boolean registerConnection(ServerThread client) {
+        synchronized (CLIENTS_LOCK) {
+            if (stopFlag || CONNECTIONS.size() >= MAX_CLIENTS) {
+                return false;
             }
-        }
-    }
 
-
-    private static Object syncFlags = new Object();
-    private static boolean stopFlag = false;
-
-    public static boolean getStopFlag() {
-        synchronized (ServerMain.syncFlags) {
-            return stopFlag;
-        }
-    }
-
-    public static void setStopFlag(boolean value) {
-        synchronized (ServerMain.syncFlags) {
-            stopFlag = value;
-        }
-    }
-
-    private static Object syncClients = new Object();
-    private static java.util.TreeMap<String, ServerThread> clients =
-            new java.util.TreeMap<>();
-
-    public static int getNumClients() {
-        synchronized (ServerMain.syncClients) {
-            return clients.size();
-        }
-    }
-
-    public static String[] getClients() {
-        synchronized (ServerMain.syncClients) {
-            return clients.keySet().toArray(new String[0]);
+            return CONNECTIONS.add(client);
         }
     }
 
     public static boolean addClient(String name, ServerThread client) {
-        synchronized (ServerMain.syncClients) {
-            if (clients.containsKey(name)) {
+        synchronized (CLIENTS_LOCK) {
+            if (stopFlag
+                    || isBlank(name)
+                    || client.isDisconnected()
+                    || !CONNECTIONS.contains(client)
+                    || CLIENTS.containsKey(name)) {
                 return false;
             }
-            clients.put(name, client);
+
+            CLIENTS.put(name, client);
             return true;
         }
     }
 
-    public static void removeClient(String name) {
-        synchronized (ServerMain.syncClients) {
-            clients.remove(name);
+    public static void removeClient(String name, ServerThread client) {
+        synchronized (CLIENTS_LOCK) {
+            if (name != null) {
+                CLIENTS.remove(name, client);
+            }
+
+            CONNECTIONS.remove(client);
         }
     }
 
-    public static ServerThread getClient(String name) {
-        synchronized (ServerMain.syncClients) {
-            return clients.get(name);
+    public static boolean getStopFlag() {
+        return stopFlag;
+    }
+
+    public static void setStopFlag(boolean value) {
+        synchronized (CLIENTS_LOCK) {
+            stopFlag = value;
+        }
+    }
+
+    private static void stopAllClients() {
+        ServerThread[] connections;
+
+        synchronized (CLIENTS_LOCK) {
+            connections = CONNECTIONS.toArray(new ServerThread[0]);
+        }
+
+        for (ServerThread client : connections) {
+            client.disconnect();
+        }
+
+        for (ServerThread client : connections) {
+            try {
+                client.join(2_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
         }
     }
 }
@@ -207,17 +261,16 @@ class ServerStopThread extends Thread {
 
     @Override
     public void run() {
-        try (Scanner in = new Scanner(System.in)) {
-            while (true) {
-                String cmd = in.nextLine();
-                if (cmd.equalsIgnoreCase("stop")) {
-                    System.out.println("Получена команда остановки...");
-                    ServerMain.setStopFlag(true);
-                    break;
-                }
+        Scanner console = new Scanner(System.in);
+
+        while (!ServerMain.getStopFlag() && console.hasNextLine()) {
+            String command = console.nextLine().trim();
+
+            if ("stop".equalsIgnoreCase(command)) {
+                System.out.println("Получена команда остановки...");
+                ServerMain.setStopFlag(true);
+                return;
             }
-        } catch (Exception e) {
-            System.err.println("Ошибка в потоке остановки: " + e.getMessage());
         }
     }
 }
